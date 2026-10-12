@@ -11,6 +11,8 @@ import android.provider.Settings;
 import android.text.TextUtils;
 
 import com.android.internal.os.BackgroundThread;
+import com.android.server.LocalServices;
+import com.android.server.pm.LauncherAppsService;
 import com.android.server.wm.sandbox.SandboxConfigStorage;
 
 import org.json.JSONArray;
@@ -189,6 +191,14 @@ public class AppHideRepository {
                 intent.putExtra(Intent.EXTRA_CHANGED_COMPONENT_NAME_LIST, new String[]{packageName});
                 intent.putExtra(Intent.EXTRA_DONT_KILL_APP, true);
                 mContext.sendBroadcastAsUser(intent, UserHandle.of(userId));
+
+                // Bao Nexus/Launcher3 cap nhat All Apps (an va hien lai).
+                final LauncherAppsService.LauncherAppsServiceInternal launcherApps =
+                        LocalServices.getService(
+                                LauncherAppsService.LauncherAppsServiceInternal.class);
+                if (launcherApps != null) {
+                    launcherApps.notifyPackageChanged(packageName, userId);
+                }
             } catch (Exception ignored) {
             }
         });
