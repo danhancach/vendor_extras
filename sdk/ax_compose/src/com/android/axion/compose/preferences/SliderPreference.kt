@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 
-@file:OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3ExpressiveApi::class)
+@file:OptIn(ExperimentalFoundationApi::class)
 
 package com.android.axion.compose.preferences
 
 import android.graphics.drawable.Drawable
+import android.view.LayoutInflater
 import android.widget.Toast
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
@@ -40,17 +41,15 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Refresh
-import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -66,8 +65,12 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.graphics.drawable.toBitmap
 import com.android.axion.compose.R
+import com.android.settingslib.widget.SettingsThemeHelper
+import com.android.settingslib.widget.preference.slider.R as SettingsLibSliderR
+import com.google.android.material.slider.Slider as MaterialSlider
 import kotlin.math.roundToInt
 
 @Composable
@@ -91,7 +94,6 @@ fun SliderPreference(
     onReset: (() -> Unit)? = null,
     onValueClick: (() -> Unit)? = null,
 ) {
-    val interactionSource = remember { MutableInteractionSource() }
     val shape = preferenceShape(position)
     val haptic = LocalHapticFeedback.current
     val contentAlpha = if (enabled) 1f else 0.38f
@@ -230,27 +232,141 @@ fun SliderPreference(
             }
         }
 
-        Slider(
+        // Dung Material Slider SettingsLib (giong Am thanh / Che do rung),
+        // tranh Compose M3E ve tick mong chong len track day.
+        SettingsLibExpressiveSlider(
             value = value,
             onValueChange = onValueChange,
             onValueChangeFinished = onValueChangeFinished,
             valueRange = valueRange,
             steps = steps,
             enabled = enabled,
-            interactionSource = interactionSource,
+            contentAlpha = contentAlpha,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = PreferenceTokens.SliderHorizontalPadding)
-                .alpha(contentAlpha),
-            colors = SliderDefaults.colors(
-                thumbColor = MaterialTheme.colorScheme.primary,
-                activeTrackColor = MaterialTheme.colorScheme.primary,
-                inactiveTrackColor = MaterialTheme.colorScheme.surfaceContainerHighest
-            )
+                .padding(horizontal = PreferenceTokens.SliderHorizontalPadding),
         )
 
         Spacer(modifier = Modifier.height(PreferenceTokens.SliderBottomSpacing))
     }
+}
+
+/**
+ * Thanh truot dong bo SettingsLib expressive (VolumeSliderPreference /
+ * vibration intensity): track day, thumb gap, an tick.
+ */
+@Composable
+private fun SettingsLibExpressiveSlider(
+    value: Float,
+    onValueChange: (Float) -> Unit,
+    onValueChangeFinished: () -> Unit,
+    valueRange: ClosedFloatingPointRange<Float>,
+    steps: Int,
+    enabled: Boolean,
+    contentAlpha: Float,
+    modifier: Modifier = Modifier,
+) {
+    val onValueChangeState = rememberUpdatedState(onValueChange)
+    val onFinishedState = rememberUpdatedState(onValueChangeFinished)
+    val rangeSpan = valueRange.endInclusive - valueRange.start
+    val stepSize = if (steps > 0 && rangeSpan > 0f) {
+        rangeSpan / (steps + 1)
+    } else {
+        0f
+    }
+
+    AndroidView(
+        factory = { context ->
+            val root = LayoutInflater.from(context).inflate(
+                SettingsLibSliderR.layout.settingslib_expressive_layout_slider,
+                null,
+                false,
+            )
+            val slider = root.findViewById<MaterialSlider>(SettingsLibSliderR.id.slider)
+            applyExpressiveSliderMetrics(slider)
+            slider.valueFrom = valueRange.start
+            slider.valueTo = valueRange.endInclusive
+            slider.stepSize = stepSize
+            // Mac dinh SettingsLib: tick an — tranh thanh mong chong track day
+            slider.isTickVisible = false
+            slider.value = value.coerceIn(slider.valueFrom, slider.valueTo)
+            slider.addOnChangeListener { _, newValue, fromUser ->
+                if (fromUser) {
+                    onValueChangeState.value(newValue)
+                }
+            }
+            slider.addOnSliderTouchListener(
+                object : MaterialSlider.OnSliderTouchListener {
+                    override fun onStartTrackingTouch(s: MaterialSlider) {}
+
+                    override fun onStopTrackingTouch(s: MaterialSlider) {
+                        onFinishedState.value()
+                    }
+                }
+            )
+            root.tag = slider
+            root
+        },
+        update = { root ->
+            val slider = root.tag as MaterialSlider
+            val from = valueRange.start
+            val to = valueRange.endInclusive
+            if (from < to) {
+                val clamped = value.coerceIn(from, to)
+                if (slider.valueFrom != from || slider.valueTo != to) {
+                    slider.value = slider.value.coerceIn(from, to)
+                    slider.valueFrom = from
+                    slider.valueTo = to
+                }
+                if (slider.stepSize != stepSize) {
+                    slider.stepSize = stepSize
+                }
+                if (slider.value != clamped) {
+                    slider.value = clamped
+                }
+            }
+            slider.isEnabled = enabled
+            root.alpha = contentAlpha
+        },
+        modifier = modifier,
+    )
+}
+
+private fun applyExpressiveSliderMetrics(slider: MaterialSlider) {
+    val context = slider.context
+    if (!SettingsThemeHelper.isExpressiveTheme(context)) {
+        return
+    }
+    val res = context.resources
+    slider.trackHeight = res.getDimensionPixelSize(
+        SettingsLibSliderR.dimen.settingslib_expressive_slider_track_height
+    )
+    slider.trackInsideCornerSize = res.getDimensionPixelSize(
+        SettingsLibSliderR.dimen.settingslib_expressive_slider_track_inside_corner_size
+    )
+    slider.trackStopIndicatorSize = res.getDimensionPixelSize(
+        SettingsLibSliderR.dimen.settingslib_expressive_slider_track_stop_indicator_size
+    )
+    slider.thumbWidth = res.getDimensionPixelSize(
+        SettingsLibSliderR.dimen.settingslib_expressive_slider_thumb_width
+    )
+    slider.thumbHeight = res.getDimensionPixelSize(
+        SettingsLibSliderR.dimen.settingslib_expressive_slider_thumb_height
+    )
+    slider.thumbElevation = res.getDimensionPixelSize(
+        SettingsLibSliderR.dimen.settingslib_expressive_slider_thumb_elevation
+    ).toFloat()
+    slider.thumbStrokeWidth = res.getDimensionPixelSize(
+        SettingsLibSliderR.dimen.settingslib_expressive_slider_thumb_stroke_width
+    ).toFloat()
+    slider.thumbTrackGapSize = res.getDimensionPixelSize(
+        SettingsLibSliderR.dimen.settingslib_expressive_slider_thumb_track_gap_size
+    )
+    val tickRadius = res.getDimensionPixelSize(
+        SettingsLibSliderR.dimen.settingslib_expressive_slider_tick_radius
+    )
+    slider.tickActiveRadius = tickRadius
+    slider.tickInactiveRadius = tickRadius
 }
 
 @Composable
