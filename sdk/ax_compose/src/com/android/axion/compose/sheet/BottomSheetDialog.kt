@@ -19,6 +19,7 @@ import android.content.res.Configuration
 import android.view.Gravity
 import android.view.Window
 import android.view.WindowManager
+import androidx.core.view.WindowCompat
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.core.Spring
@@ -138,8 +139,13 @@ fun BottomSheetDialog(
             setDimAmount(SCRIM_ALPHA)
             setWindowAnimations(0)
             addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
+            clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_NAVIGATION)
             attributes = attributes.also { it.fitInsetsSides = 0 }
             statusBarColor = Color.Transparent.toArgb()
+            navigationBarColor = Color.Transparent.toArgb()
+            isNavigationBarContrastEnforced = false
+            decorView.setBackgroundColor(android.graphics.Color.TRANSPARENT)
+            WindowCompat.setDecorFitsSystemWindows(this, false)
         }
 
         val flingBehavior = AnchoredDraggableDefaults.flingBehavior(
@@ -216,20 +222,14 @@ fun BottomSheetDialog(
                 color = containerColor,
                 shape = SheetShape,
             ) {
-                Box(
-                    Modifier.padding(
-                        bottom = with(density) {
-                            WindowInsets.safeDrawing.getBottom(this).toDp()
-                        }
-                    )
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .wrapContentWidth(Alignment.CenterHorizontally),
+                    horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    Column(
-                        Modifier.wrapContentWidth(Alignment.CenterHorizontally),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                    ) {
-                        DragHandle(onDismiss = animatedDismiss)
-                        content()
-                    }
+                    DragHandle(onDismiss = animatedDismiss)
+                    content()
                 }
             }
         }
