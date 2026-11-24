@@ -16,6 +16,7 @@
 
 package com.android.axion.blur
 
+import android.graphics.Matrix as AndroidMatrix
 import android.provider.Settings
 import android.view.View
 import android.view.ViewTreeObserver
@@ -39,6 +40,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Matrix as ComposeMatrix
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.drawscope.ContentDrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -46,7 +48,7 @@ import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.LayoutCoordinates
-import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.findRootCoordinates
 import androidx.compose.ui.node.CompositionLocalConsumerModifierNode
 import androidx.compose.ui.node.DrawModifierNode
 import androidx.compose.ui.node.GlobalPositionAwareModifierNode
@@ -73,6 +75,38 @@ import com.android.axion.kotlin.settings.SettingsType
 import kotlin.math.roundToInt
 
 val LocalAxBlurEnabled = staticCompositionLocalOf { true }
+
+/**
+ * Ket qua ve surface local (draw-path Compose/BlurEngine — KHONG GPU/SF PRESENT).
+ * NoSurface / AlphaZero khong emit callback.
+ */
+enum class AxBlurSurfacePaintKind {
+    /** BlurEngine cross-window / source, surfaceAlpha>0. */
+    NativeBackdrop,
+    /** fallbackColor ve that khi blur off / unsupported / draw fail. */
+    FallbackSurfaceRendered,
+}
+
+/**
+ * Listener sau native backdrop draw (cross-window/source, surfaceAlpha>0).
+ * KHONG fire khi alpha_zero / fallback-only / blur disabled.
+ * Giu cho caller cu; open-glass uu tien [LocalAxBlurDestinationSurfaceDrawListener].
+ */
+val LocalAxBlurNativeBackdropDrawListener =
+    staticCompositionLocalOf<((widthPx: Int, heightPx: Int, surfaceAlpha: Float) -> Unit)?> {
+        null
+    }
+
+/**
+ * Listener sau ve thanh cong surface α>0 (NativeBackdrop HOAC FallbackSurfaceRendered).
+ * Chi fire khi listener != null — khong callback moi frame o surface thuong.
+ */
+val LocalAxBlurDestinationSurfaceDrawListener =
+    staticCompositionLocalOf<
+        ((widthPx: Int, heightPx: Int, surfaceAlpha: Float, kind: AxBlurSurfacePaintKind) -> Unit)?
+    > {
+        null
+    }
 
 object AxBlurSurfaceDefaults {
     @Composable
@@ -198,10 +232,34 @@ fun Modifier.axBlurBackground(
     fallbackColor: Color,
     tintColor: Color,
     cornerRadius: Dp = Dp.Unspecified,
+    /**
+     * Ban kinh Y (elliptical). Unspecified → dung [cornerRadius] (scalar cu).
+     * Anisotropic host scale: localRx≠localRy de sau scale visual rx≈ry.
+     */
+    cornerRadiusY: Dp = Dp.Unspecified,
     settingsSpec: AxBackdropBlurSettingsSpec = AxBackdropBlurSettingsSpec.system(),
     alpha: Float = 1f,
     highlight: Brush? = null,
     highlightWidth: Dp = AxBlurSurfaceDefaults.HighlightWidth,
+    includeViewBackdrop: Boolean = true,
+    /**
+     * Sau native backdrop draw (cross-window/source, alpha>0).
+     * null → dung [LocalAxBlurNativeBackdropDrawListener] neu co.
+     * Mac dinh giu API cu — khong anh huong caller khong await open-glass.
+     */
+    onNativeBackdropDrawn: ((widthPx: Int, heightPx: Int, surfaceAlpha: Float) -> Unit)? = null,
+    /**
+     * Sau ve thanh cong surface α>0: NativeBackdrop hoac FallbackSurfaceRendered.
+     * null → [LocalAxBlurDestinationSurfaceDrawListener]. KHONG goi native ACK khi fallback.
+     */
+    onDestinationSurfaceDrawn:
+        ((
+            widthPx: Int,
+            heightPx: Int,
+            surfaceAlpha: Float,
+            kind: AxBlurSurfacePaintKind,
+        ) -> Unit)? =
+            null,
 ): Modifier {
     val density = LocalDensity.current
     val view = LocalView.current
@@ -209,60 +267,126 @@ fun Modifier.axBlurBackground(
     val blur = remember(view, settingsSpec) {
         BlurEngine(view).apply {
             useSettings(settingsSpec)
+            setIncludeViewBackdrop(includeViewBackdrop)
             setEnabled(blurEnabled)
         }
     }
     val tintArgb = tintColor.toArgb()
-    val requestedCornerRadiusPx = if (cornerRadius.isSpecified) {
+    val requestedCornerRadiusXPx = if (cornerRadius.isSpecified) {
         with(density) { cornerRadius.toPx() }
+    } else {
+        Float.NaN
+    }
+    val requestedCornerRadiusYPx = if (cornerRadiusY.isSpecified) {
+        with(density) { cornerRadiusY.toPx() }
     } else {
         Float.NaN
     }
     val surfaceAlpha = alpha.coerceIn(0f, 1f)
     val blurAlpha = (surfaceAlpha * 255).toInt()
     val highlightWidthPx = with(density) { highlightWidth.toPx() }
+    val nativeBackdropListener =
+        onNativeBackdropDrawn ?: LocalAxBlurNativeBackdropDrawListener.current
+    val destinationSurfaceListener =
+        onDestinationSurfaceDrawn ?: LocalAxBlurDestinationSurfaceDrawListener.current
 
     DisposableEffect(blur) {
         onDispose(blur::dispose)
     }
 
+    // Alpha/visibility native DOC LAP draw: underPeekClip peek=0 skip drawContent
+    // → neu chi setAlpha trong draw, BackgroundBlurDrawable giu alpha cu tren SF.
+    // BlurEngine.setAlpha idempotent (same value no-op) — khong loop invalidate.
     SideEffect {
+        blur.setIncludeViewBackdrop(includeViewBackdrop)
         blur.setEnabled(blurEnabled)
+        blur.setAlpha(blurAlpha)
     }
 
-    return axBlurFrameTracking(blurEnabled).drawWithContent {
+    return axBlurFrameTracking(blur, blurEnabled).drawWithContent {
         val width = size.width.roundToInt()
         val height = size.height.roundToInt()
-        val cornerRadiusPx = if (requestedCornerRadiusPx.isFinite()) {
-            requestedCornerRadiusPx
-        } else {
-            size.minDimension * 0.5f
-        }
+        val fallbackR = size.minDimension * 0.5f
+        val cornerRadiusXPx =
+            if (requestedCornerRadiusXPx.isFinite()) requestedCornerRadiusXPx else fallbackR
+        val cornerRadiusYPx =
+            if (requestedCornerRadiusYPx.isFinite()) {
+                requestedCornerRadiusYPx
+            } else {
+                cornerRadiusXPx
+            }
+        val elliptical = kotlin.math.abs(cornerRadiusXPx - cornerRadiusYPx) > 0.05f
         val drewBlur = if (blurEnabled && width > 0 && height > 0) {
+            // Draw-time van setAlpha — frame animate/moving dung ngay trong pass ve.
             blur.setAlpha(blurAlpha)
             blur.setOverlayColor(tintArgb)
             var result = false
             drawIntoCanvas { canvas ->
-                result = blur.draw(
-                    canvas.nativeCanvas,
-                    0,
-                    0,
-                    width,
-                    height,
-                    cornerRadiusPx,
-                )
+                // 0,0,w,h local canvas; offset node->host da set qua frame tracking (SOURCE only).
+                result =
+                    if (elliptical) {
+                        val radii =
+                            floatArrayOf(
+                                cornerRadiusXPx,
+                                cornerRadiusYPx,
+                                cornerRadiusXPx,
+                                cornerRadiusYPx,
+                                cornerRadiusXPx,
+                                cornerRadiusYPx,
+                                cornerRadiusXPx,
+                                cornerRadiusYPx,
+                            )
+                        blur.draw(
+                            canvas.nativeCanvas,
+                            0,
+                            0,
+                            width,
+                            height,
+                            radii,
+                        )
+                    } else {
+                        blur.draw(
+                            canvas.nativeCanvas,
+                            0,
+                            0,
+                            width,
+                            height,
+                            cornerRadiusXPx,
+                        )
+                    }
             }
             result
         } else {
             false
         }
-        if (!drewBlur && surfaceAlpha > 0f) {
+        val canReportSurface = surfaceAlpha > 0f && width > 0 && height > 0
+        // Native backdrop that: surfaceAlpha>0 + cross-window/source (khong alpha_zero).
+        val nativeBackdropOk =
+            canReportSurface && drewBlur && blur.lastDrawWasNativeBackdrop()
+        if (nativeBackdropOk) {
+            nativeBackdropListener?.invoke(width, height, surfaceAlpha)
+            destinationSurfaceListener?.invoke(
+                width,
+                height,
+                surfaceAlpha,
+                AxBlurSurfacePaintKind.NativeBackdrop,
+            )
+        }
+        // Blur off / unsupported / draw fail: ve fallbackColor (khong tang opaque).
+        // Chi ACK Fallback khi fallback that su da ve — khong fake native.
+        if (!drewBlur && canReportSurface) {
             // Fades with the surface: a caller animating `alpha` out shouldn't leave the opaque
             // fallback behind on devices without blur.
             drawRoundRect(
                 color = fallbackColor,
-                cornerRadius = CornerRadius(cornerRadiusPx),
+                cornerRadius = CornerRadius(cornerRadiusXPx, cornerRadiusYPx),
                 alpha = surfaceAlpha,
+            )
+            destinationSurfaceListener?.invoke(
+                width,
+                height,
+                surfaceAlpha,
+                AxBlurSurfacePaintKind.FallbackSurfaceRendered,
             )
         }
         drawContent()
@@ -273,7 +397,11 @@ fun Modifier.axBlurBackground(
                 brush = highlight,
                 topLeft = Offset(inset, inset),
                 size = Size(size.width - highlightWidthPx, size.height - highlightWidthPx),
-                cornerRadius = CornerRadius((cornerRadiusPx - inset).coerceAtLeast(0f)),
+                cornerRadius =
+                    CornerRadius(
+                        (cornerRadiusXPx - inset).coerceAtLeast(0f),
+                        (cornerRadiusYPx - inset).coerceAtLeast(0f),
+                    ),
                 style = Stroke(width = highlightWidthPx),
                 alpha = surfaceAlpha,
             )
@@ -281,16 +409,17 @@ fun Modifier.axBlurBackground(
     }
 }
 
-private fun Modifier.axBlurFrameTracking(enabled: Boolean): Modifier =
-    this then AxBlurFrameTrackingElement(enabled)
+private fun Modifier.axBlurFrameTracking(blur: BlurEngine, enabled: Boolean): Modifier =
+    this then AxBlurFrameTrackingElement(blur, enabled)
 
 private data class AxBlurFrameTrackingElement(
+    val blur: BlurEngine,
     val enabled: Boolean,
 ) : ModifierNodeElement<AxBlurFrameTrackingNode>() {
-    override fun create() = AxBlurFrameTrackingNode(enabled)
+    override fun create() = AxBlurFrameTrackingNode(blur, enabled)
 
     override fun update(node: AxBlurFrameTrackingNode) {
-        node.update(enabled)
+        node.update(blur, enabled)
     }
 
     override fun InspectorInfo.inspectableProperties() {
@@ -300,6 +429,7 @@ private data class AxBlurFrameTrackingElement(
 }
 
 private class AxBlurFrameTrackingNode(
+    private var blur: BlurEngine,
     private var enabled: Boolean,
 ) : Modifier.Node(),
     CompositionLocalConsumerModifierNode,
@@ -333,10 +463,29 @@ private class AxBlurFrameTrackingNode(
 
     override val shouldAutoInvalidate = false
 
-    fun update(enabled: Boolean) {
-        if (this.enabled == enabled) return
-        this.enabled = enabled
-        updatePreDrawObserver()
+    private val composeMatrix = ComposeMatrix()
+    private val androidMatrix = AndroidMatrix()
+    private val androidMatrixValues = FloatArray(9)
+
+    fun update(blur: BlurEngine, enabled: Boolean) {
+        val blurChanged = this.blur !== blur
+        val enabledChanged = this.enabled != enabled
+        if (!blurChanged && !enabledChanged) return
+        if (blurChanged) {
+            this.blur.clearSourceSampleTransform()
+            this.blur = blur
+            // Day geometry hien tai sang engine moi.
+            publishSampleTransform()
+        }
+        if (enabledChanged) {
+            this.enabled = enabled
+            if (!enabled) {
+                blur.clearSourceSampleTransform()
+            } else {
+                publishSampleTransform()
+            }
+            updatePreDrawObserver()
+        }
         invalidateDraw()
     }
 
@@ -346,6 +495,7 @@ private class AxBlurFrameTrackingNode(
 
     override fun onDetach() {
         removePreDrawObserver()
+        blur.clearSourceSampleTransform()
         hostView = null
         lastCoordinates = null
         geometry = AxBlurFrameGeometry()
@@ -382,30 +532,62 @@ private class AxBlurFrameTrackingNode(
 
     private fun updateCoordinates(coordinates: LayoutCoordinates) {
         lastCoordinates = coordinates
-        val bounds = coordinates.boundsInRoot()
-        val newPosition = bounds.topLeft
-        val newSize = bounds.size
+        if (!coordinates.isAttached) {
+            geometry = AxBlurFrameGeometry()
+            blur.clearSourceSampleTransform()
+            invalidateDraw()
+            return
+        }
+        val root = coordinates.findRootCoordinates()
+        // Goc local (0,0) trong root — dung de invalidate khi doi cho; transform day du qua publish.
+        val originInRoot = coordinates.localToRoot(Offset.Zero)
+        val newSize = Size(
+            coordinates.size.width.toFloat(),
+            coordinates.size.height.toFloat(),
+        )
         val newWindowId = currentWindowId()
         val nextGeometry = AxBlurFrameGeometry(
-            position = newPosition,
+            position = originInRoot,
             size = newSize,
             windowId = newWindowId,
+            rootHash = System.identityHashCode(root),
         )
         if (geometry != nextGeometry) {
             geometry = nextGeometry
+            publishSampleTransform()
             invalidateDraw()
+        } else {
+            // Size/goc giong bounding nhung scale/clip co the doi — luon refresh matrix.
+            publishSampleTransform()
         }
     }
 
-    private fun currentWindowId(): Any? {
-        return hostView?.windowId ?: currentValueOf(LocalView).windowId
+    private fun publishSampleTransform() {
+        if (!enabled) return
+        val coordinates = lastCoordinates
+        if (coordinates == null || !coordinates.isAttached) {
+            blur.clearSourceSampleTransform()
+            return
+        }
+        val root = coordinates.findRootCoordinates()
+        composeMatrix.reset()
+        // Compose 1.12: transformFrom(source, Matrix) — KHONG truyen FloatArray (.values).
+        // host/root → local node (gom scale/clip/transform), khong chi dich bounding box.
+        coordinates.transformFrom(root, composeMatrix)
+        composeMatrixToAndroid(composeMatrix, androidMatrix, androidMatrixValues)
+        blur.setSourceSampleTransform(androidMatrix)
     }
 
     private data class AxBlurFrameGeometry(
         val position: Offset = Offset.Unspecified,
         val size: Size = Size.Unspecified,
         val windowId: Any? = null,
+        val rootHash: Int = 0,
     )
+
+    private fun currentWindowId(): Any? {
+        return hostView?.windowId ?: currentValueOf(LocalView).windowId
+    }
 
     private fun updatePreDrawObserver() {
         val view = if (isAttached && enabled) currentValueOf(LocalView) else null
@@ -428,4 +610,23 @@ private class AxBlurFrameTrackingNode(
         hostView?.viewTreeObserver?.takeIf { it.isAlive }?.removeOnPreDrawListener(preDrawListener)
         observingPreDraw = false
     }
+}
+
+/** Compose Matrix 4x4 (column-major) → android.graphics.Matrix 3x3. */
+private fun composeMatrixToAndroid(
+    compose: ComposeMatrix,
+    out: AndroidMatrix,
+    scratch9: FloatArray,
+) {
+    val v = compose.values
+    scratch9[AndroidMatrix.MSCALE_X] = v[ComposeMatrix.ScaleX]
+    scratch9[AndroidMatrix.MSKEW_X] = v[ComposeMatrix.SkewX]
+    scratch9[AndroidMatrix.MTRANS_X] = v[ComposeMatrix.TranslateX]
+    scratch9[AndroidMatrix.MSKEW_Y] = v[ComposeMatrix.SkewY]
+    scratch9[AndroidMatrix.MSCALE_Y] = v[ComposeMatrix.ScaleY]
+    scratch9[AndroidMatrix.MTRANS_Y] = v[ComposeMatrix.TranslateY]
+    scratch9[AndroidMatrix.MPERSP_0] = v[ComposeMatrix.Perspective0]
+    scratch9[AndroidMatrix.MPERSP_1] = v[ComposeMatrix.Perspective1]
+    scratch9[AndroidMatrix.MPERSP_2] = v[ComposeMatrix.Perspective2]
+    out.setValues(scratch9)
 }

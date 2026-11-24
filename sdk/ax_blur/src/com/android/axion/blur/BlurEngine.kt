@@ -104,10 +104,14 @@ open class BlurEngine @JvmOverloads constructor(
     private var alpha = 255
     private var overlayColor = Color.TRANSPARENT
     private var sourceView: View? = null
+    private var includeViewBackdrop = true
     private var crossWindowAlphaSource: View? = null
     private var sourceBlurRecorded = false
     private var sourceBlurDirty = true
     private var isBackdropFrozen = false
+    // Bien doi host -> local node Compose. Chi SOURCE/in-window; KHONG dung cho cross-window.
+    private val sourceSampleTransform = Matrix()
+    private var hasSourceSampleTransform = false
     private var recordedSourceState = SourceRecord()
     private var sourceBlurEffect: RenderEffect? = null
     private var sourceBlurEffectRadius = -1f
@@ -126,6 +130,19 @@ open class BlurEngine @JvmOverloads constructor(
     private var lastDrawHardwareAccelerated = false
     private var lastDrawPath = "none"
     private var lastDrawSucceeded = false
+
+    /**
+     * true = lan draw gan nhat ve native backdrop (cross-window / source).
+     * false = alpha_zero hideDrawable, geometry/fail, blur disabled (chua goi draw),
+     * hoac chua draw. Open-glass: NativeBackdrop ACK chi khi true + α>0;
+     * draw()=false / blur off → AxBlurSurface ve fallbackColor (FallbackSurfaceRendered).
+     * KHONG coi alpha_zero / failed la native ready; KHONG GPU/SF PRESENT.
+     */
+    fun lastDrawWasNativeBackdrop(): Boolean =
+        lastDrawSucceeded &&
+            (lastDrawPath == "cross_window" ||
+                lastDrawPath == "source" ||
+                lastDrawPath == "cross_window_source")
     private var wasEnabled = false
     private var blurFraction = 1f
     private var baseBlurRadiusPx = 0f
@@ -177,7 +194,19 @@ open class BlurEngine @JvmOverloads constructor(
     fun isBlurActive(): Boolean {
         if (!attached || !view.isAttachedToWindow || AxBlurSupport.isBlurDisabled()) return false
         if (!globalBlurEnabled || !shouldTrackFrames()) return false
-        return isCrossWindowBlurActive() || autoDiscoverSource() != null
+        return isCrossWindowBlurActive() || (includeViewBackdrop && autoDiscoverSource() != null)
+    }
+
+    /** Wallpaper-only surfaces must not composite the window's scrims over their glass tint. */
+    fun setIncludeViewBackdrop(include: Boolean) {
+        if (includeViewBackdrop == include) return
+        includeViewBackdrop = include
+        if (!include) {
+            sourceView = null
+            sourceDrawStopBranch = null
+            discardSourceBlur()
+        }
+        invalidateHost()
     }
 
     fun setEnabled(enabled: Boolean) {
@@ -276,6 +305,36 @@ open class BlurEngine @JvmOverloads constructor(
         }
     }
 
+    /**
+     * Phep bien doi toa do host (AndroidComposeView) → local node Compose.
+     * drawSourceBlur concat nghich dao (matrix nay) de sample dung vung sau khung
+     * ke ca khi scale/clip — khong chi dich x/y bounding box.
+     * Cross-window (BackgroundBlurDrawable / SF) khong dung transform nay.
+     */
+    fun setSourceSampleTransform(matrix: Matrix?) {
+        if (matrix == null || matrix.isIdentity) {
+            if (!hasSourceSampleTransform) return
+            sourceSampleTransform.reset()
+            hasSourceSampleTransform = false
+            invalidateHost()
+            return
+        }
+        val next = FloatArray(9)
+        matrix.getValues(next)
+        if (hasSourceSampleTransform) {
+            val prev = FloatArray(9)
+            sourceSampleTransform.getValues(prev)
+            if (next.contentEquals(prev)) return
+        }
+        sourceSampleTransform.setValues(next)
+        hasSourceSampleTransform = true
+        invalidateHost()
+    }
+
+    fun clearSourceSampleTransform() {
+        setSourceSampleTransform(null)
+    }
+
     fun isBackdropFrozen(): Boolean = isBackdropFrozen
 
     fun invalidateBackdrop() {
@@ -365,6 +424,8 @@ open class BlurEngine @JvmOverloads constructor(
         pw.println("  sourceView=${describeView(sourceView)}")
         pw.println("  sourceBlurRecorded=$sourceBlurRecorded sourceBlurDirty=$sourceBlurDirty " +
             "recordedSourceState=$recordedSourceState")
+        pw.println("  hasSourceSampleTransform=$hasSourceSampleTransform " +
+            "sourceSampleTransform=$sourceSampleTransform")
         pw.println("  sourceBlurEffectRadius=$sourceBlurEffectRadius sourceBlurSaturation=" +
             "$sourceBlurSaturation sourceBlurCurveBias=$sourceBlurCurveBias captureScale=$captureScale")
         pw.println("  sourceBlurNodeHasDisplayList=${sourceBlurNode.hasDisplayList()}")
@@ -623,14 +684,18 @@ open class BlurEngine @JvmOverloads constructor(
         } else {
             false
         }
-        autoDiscoverSource()
         // The cross-window drawable already painted the overlay colour; painting it again over the
         // in-window layer doubled the tint wherever both paths drew.
-        val drewSource = drawSourceBlur(
-            canvas, left, top, right, bottom,
-            cornerRadii, cornerRadius, crossWindowAlpha, clipPath,
-            withOverlay = !drewCrossWindow,
-        )
+        val drewSource = if (includeViewBackdrop) {
+            autoDiscoverSource()
+            drawSourceBlur(
+                canvas, left, top, right, bottom,
+                cornerRadii, cornerRadius, crossWindowAlpha, clipPath,
+                withOverlay = !drewCrossWindow,
+            )
+        } else {
+            false
+        }
         if (!drewSource && !drewCrossWindow) {
             if (crossWindowAlpha > 0) clearKey(key)
             lastDrawPath = "failed"
@@ -719,7 +784,13 @@ open class BlurEngine @JvmOverloads constructor(
             canvas.save()
         }
         clip(canvas, left, top, right, bottom, cornerRadii, cornerRadius, clipPath)
+        // recordSource theo toa do host; concat host→local de khop scale/clip (khong chi offset).
+        val sampleSave = canvas.save()
+        if (hasSourceSampleTransform) {
+            canvas.concat(sourceSampleTransform)
+        }
         canvas.drawRenderNode(sourceBlurNode)
+        canvas.restoreToCount(sampleSave)
         if (withOverlay) {
             drawOverlay(canvas, left, top, right, bottom, cornerRadii, cornerRadius, clipPath)
         }
@@ -1225,11 +1296,16 @@ open class BlurEngine @JvmOverloads constructor(
         cornerRadius: Float,
     ) {
         if (cornerRadii != null && cornerRadii.size >= 8) {
+            // Path order: TL,TR,BR,BL (rx,ry moi goc). Drawable: TL,TR,BL,BR elliptical.
             blurDrawable.setCornerRadius(
-                cornerRadii.cornerRadiusAt(0),
-                cornerRadii.cornerRadiusAt(2),
-                cornerRadii.cornerRadiusAt(6),
-                cornerRadii.cornerRadiusAt(4),
+                cornerRadii[0].coerceAtLeast(0f),
+                cornerRadii[1].coerceAtLeast(0f),
+                cornerRadii[2].coerceAtLeast(0f),
+                cornerRadii[3].coerceAtLeast(0f),
+                cornerRadii[6].coerceAtLeast(0f),
+                cornerRadii[7].coerceAtLeast(0f),
+                cornerRadii[4].coerceAtLeast(0f),
+                cornerRadii[5].coerceAtLeast(0f),
             )
             return
         }
@@ -1397,6 +1473,8 @@ open class BlurEngine @JvmOverloads constructor(
         trackedStates.clear()
         sourceView = null
         sourceDrawStopBranch = null
+        sourceSampleTransform.reset()
+        hasSourceSampleTransform = false
         discardSourceBlur()
         updatePreDrawObserver()
     }
