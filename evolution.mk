@@ -19,17 +19,12 @@ PRODUCT_PACKAGES += \
 endif
 
 PRODUCT_PACKAGES += \
-    HideSmartSpace \
     ImeNavBarSpaceOverlay \
     SmartSpaceOffset
 
 # Fonts
 PRODUCT_PACKAGES += \
     fonts_customization.xml \
-    fonts_customization_emoji_facebook.xml \
-    fonts_customization_emoji_ios.xml \
-    fonts_customization_emoji_samsung.xml \
-    fonts_customization_emoji_swiftui.xml \
     ClockFontACFilmstripOverlay \
     ClockFontAccuratistOverlay \
     ClockFontAclonicaOverlay \
@@ -105,7 +100,6 @@ PRODUCT_PACKAGES += \
     ClockFontRoundheadsOverlay \
     ClockFontRubikOverlay \
     ClockFontSamsungOneOverlay \
-    ClockFontSansSerifOverlay \
     ClockFontScrapItUpOverlay \
     ClockFontSonySketchOverlay \
     ClockFontSpaceGameOverlay \
@@ -142,7 +136,6 @@ PRODUCT_PACKAGES += \
     FontFifa2018Overlay \
     FontGrandHotelOverlay \
     FontGeneralSansOverlay \
-    FontGoogleSansFlexOverlay \
     FontHarmonySansOverlay \
     FontIBMPlexSansOverlay \
     FontLatoOverlay \
@@ -171,7 +164,6 @@ PRODUCT_PACKAGES += \
     FontSamsungOneOverlay \
     FontOhMyFontOverlay \
     FontSanFranciscoDisplayProSourceOverlay \
-    FontSansSerifOverlay \
     FontSonySketchOverlay \
     FontSpaceGroteskOverlay \
     FontStoropiaOverlay \
@@ -233,13 +225,11 @@ PRODUCT_PACKAGES += \
     UdfpsIcons
 endif
 
-# Include {Lato,Rubik} fonts
+# Include {Lato,Rubik,GoogleSansFlex} fonts
 $(call inherit-product-if-exists, external/google-fonts/lato/fonts.mk)
 $(call inherit-product-if-exists, external/google-fonts/rubik/fonts.mk)
+$(call inherit-product-if-exists, external/google-fonts/google-sans-flex/fonts.mk)
 
 PRODUCT_COPY_FILES += \
     $(call find-copy-subdir-files,*,vendor/extras/prebuilt/product/fonts,$(TARGET_COPY_OUT_PRODUCT)/fonts) \
     $(call find-copy-subdir-files,*,vendor/extras/prebuilt/product/media/audio/ui,$(TARGET_COPY_OUT_PRODUCT)/media/audio/ui)
-
-PRODUCT_PRODUCT_PROPERTIES += \
-    persist.sys.ax_emoji_style=android

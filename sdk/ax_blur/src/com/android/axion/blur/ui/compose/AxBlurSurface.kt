@@ -40,8 +40,10 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Outline
 import androidx.compose.ui.graphics.Matrix as ComposeMatrix
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.drawOutline
 import androidx.compose.ui.graphics.drawscope.ContentDrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
@@ -220,6 +222,7 @@ fun AxBlurSurface(
                 settingsSpec = settingsSpec,
                 alpha = alpha,
                 highlight = highlight,
+                shape = shape,
             ),
         contentAlignment = contentAlignment,
         content = content,
@@ -260,6 +263,7 @@ fun Modifier.axBlurBackground(
             kind: AxBlurSurfacePaintKind,
         ) -> Unit)? =
             null,
+    shape: Shape? = null,
 ): Modifier {
     val density = LocalDensity.current
     val view = LocalView.current
@@ -272,6 +276,7 @@ fun Modifier.axBlurBackground(
         }
     }
     val tintArgb = tintColor.toArgb()
+    val cornerRadii = remember { FloatArray(8) }
     val requestedCornerRadiusXPx = if (cornerRadius.isSpecified) {
         with(density) { cornerRadius.toPx() }
     } else {
@@ -306,9 +311,15 @@ fun Modifier.axBlurBackground(
     return axBlurFrameTracking(blur, blurEnabled).drawWithContent {
         val width = size.width.roundToInt()
         val height = size.height.roundToInt()
-        val fallbackR = size.minDimension * 0.5f
-        val cornerRadiusXPx =
-            if (requestedCornerRadiusXPx.isFinite()) requestedCornerRadiusXPx else fallbackR
+        // A non-null shape draws the blur and the fallback with its own outline, so per-corner
+        // radii (a dialog, a bottom sheet) are honoured instead of one uniform radius.
+        val outline = shape?.createOutline(size, layoutDirection, this)
+        val cornerRadiusXPx = when {
+            requestedCornerRadiusXPx.isFinite() -> requestedCornerRadiusXPx
+            outline is Outline.Rounded -> outline.roundRect.topLeftCornerRadius.x
+            outline is Outline.Rectangle -> 0f
+            else -> size.minDimension * 0.5f
+        }
         val cornerRadiusYPx =
             if (requestedCornerRadiusYPx.isFinite()) {
                 requestedCornerRadiusYPx
@@ -322,9 +333,38 @@ fun Modifier.axBlurBackground(
             blur.setOverlayColor(tintArgb)
             var result = false
             drawIntoCanvas { canvas ->
-                // 0,0,w,h local canvas; offset node->host da set qua frame tracking (SOURCE only).
-                result =
-                    if (elliptical) {
+                result = when (outline) {
+                    is Outline.Rounded -> {
+                        val rect = outline.roundRect
+                        cornerRadii[0] = rect.topLeftCornerRadius.x
+                        cornerRadii[1] = rect.topLeftCornerRadius.y
+                        cornerRadii[2] = rect.topRightCornerRadius.x
+                        cornerRadii[3] = rect.topRightCornerRadius.y
+                        cornerRadii[4] = rect.bottomRightCornerRadius.x
+                        cornerRadii[5] = rect.bottomRightCornerRadius.y
+                        cornerRadii[6] = rect.bottomLeftCornerRadius.x
+                        cornerRadii[7] = rect.bottomLeftCornerRadius.y
+                        blur.draw(
+                            canvas.nativeCanvas,
+                            rect.left.roundToInt(),
+                            rect.top.roundToInt(),
+                            rect.right.roundToInt(),
+                            rect.bottom.roundToInt(),
+                            cornerRadii,
+                        )
+                    }
+                    is Outline.Rectangle -> {
+                        val rect = outline.rect
+                        blur.draw(
+                            canvas.nativeCanvas,
+                            rect.left.roundToInt(),
+                            rect.top.roundToInt(),
+                            rect.right.roundToInt(),
+                            rect.bottom.roundToInt(),
+                            0f,
+                        )
+                    }
+                    else -> if (elliptical) {
                         val radii =
                             floatArrayOf(
                                 cornerRadiusXPx,
@@ -354,6 +394,7 @@ fun Modifier.axBlurBackground(
                             cornerRadiusXPx,
                         )
                     }
+                }
             }
             result
         } else {
@@ -377,11 +418,15 @@ fun Modifier.axBlurBackground(
         if (!drewBlur && canReportSurface) {
             // Fades with the surface: a caller animating `alpha` out shouldn't leave the opaque
             // fallback behind on devices without blur.
-            drawRoundRect(
-                color = fallbackColor,
-                cornerRadius = CornerRadius(cornerRadiusXPx, cornerRadiusYPx),
-                alpha = surfaceAlpha,
-            )
+            if (outline != null) {
+                drawOutline(outline, color = fallbackColor, alpha = surfaceAlpha)
+            } else {
+                drawRoundRect(
+                    color = fallbackColor,
+                    cornerRadius = CornerRadius(cornerRadiusXPx, cornerRadiusYPx),
+                    alpha = surfaceAlpha,
+                )
+            }
             destinationSurfaceListener?.invoke(
                 width,
                 height,

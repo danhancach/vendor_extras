@@ -40,8 +40,8 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public class AppLockService {
     public static final String SANDBOX_PACKAGE = "com.android.axion.sandbox";
-    public static final String APPLOCKER_PACKAGE = "com.android.applocker";
-    private static final String APPLOCKER_ACTIVITY = "com.android.applocker.AuthenticateActivity";
+    private static final ComponentName UNLOCK_PROMPT_COMPONENT = new ComponentName(
+            SANDBOX_PACKAGE, "com.android.axion.sandbox.AuthenticateActivity");
 
     private static final String EXTRA_LOCKED_UID = "LOCKED_UID";
     private static final String EXTRA_LOCKED_PACKAGE = "LOCKED_PACKAGE";
@@ -54,13 +54,42 @@ public class AppLockService {
     public static final int LOCK_BEHAVIOR_ON_SCREEN_OFF = 2;
     public static final int LOCK_BEHAVIOR_ON_KILL = 3;
 
+    public static final String SETTINGS_PACKAGE = "com.android.settings";
+
+    /** Packages that can never be hidden or sandboxed, and are trusted callers for those. */
     public static final Set<String> BLACKLISTED_PACKAGES = Set.of(
             "com.android.systemui",
             "com.android.launcher3",
             "android",
-            "com.android.settings",
-            SANDBOX_PACKAGE,
-            APPLOCKER_PACKAGE
+            SETTINGS_PACKAGE,
+            SANDBOX_PACKAGE
+    );
+
+    /**
+     * Packages that can never be app locked. Unlike {@link #BLACKLISTED_PACKAGES}, Settings
+     * is lockable: it is a regular launcher app and the unlock prompt does not depend on it.
+     */
+    private static final Set<String> LOCK_EXEMPT_PACKAGES = Set.of(
+            "com.android.systemui",
+            "com.android.launcher3",
+            "android",
+            SANDBOX_PACKAGE
+    );
+
+    /**
+     * Settings activities that confirm the device credential for other apps (KeyguardManager).
+     * They are an authentication step themselves, so gating them behind the app lock would
+     * double prompt, and cancelling the app lock prompt would abort the caller's flow.
+     */
+    private static final Set<String> LOCK_EXEMPT_SETTINGS_ACTIVITIES = Set.of(
+            SETTINGS_PACKAGE + ".ConfirmDeviceCredentialActivity",
+            SETTINGS_PACKAGE + ".ConfirmRemoteDeviceCredentialActivity",
+            SETTINGS_PACKAGE + ".password.ConfirmDeviceCredentialActivity",
+            SETTINGS_PACKAGE + ".password.ConfirmDeviceCredentialActivity$InternalActivity",
+            SETTINGS_PACKAGE + ".password.ConfirmLockPassword",
+            SETTINGS_PACKAGE + ".password.ConfirmLockPassword$InternalActivity",
+            SETTINGS_PACKAGE + ".password.ConfirmLockPattern",
+            SETTINGS_PACKAGE + ".password.ConfirmLockPattern$InternalActivity"
     );
 
     private static volatile AppLockService sInstance;
@@ -80,14 +109,14 @@ public class AppLockService {
     private final Set<String> mUnlockedApps = ConcurrentHashMap.newKeySet();
     private final Set<String> mPendingUnlocks = ConcurrentHashMap.newKeySet();
     private final Map<String, ActivityRecord> mPendingTargets = new ConcurrentHashMap<>();
-    private final Map<String, Long> mUnlockTimestamps = new ConcurrentHashMap<>();
+    private final Map<String, Long> mLeftAt = new ConcurrentHashMap<>();
     private final Map<String, Runnable> mTimeoutRunnables = new ConcurrentHashMap<>();
 
     private Intent mConfirmIntent;
     private ResolveInfo mSandboxResolveInfo;
     private int mRequestCode;
     private int mCurrentUserId = 0;
-    private boolean mKeyguardDone = true;
+    private volatile boolean mKeyguardDone = true;
     private String mLastFocusedAppKey = null;
     private int mLastFocusedTaskId = INVALID_TASK_ID;
 
@@ -109,9 +138,17 @@ public class AppLockService {
     }
 
     public void setKeyguardDone(boolean done) {
+        final boolean changed = mKeyguardDone != done;
         mKeyguardDone = done;
-        if (!done && mRepository.getLockBehavior() == LOCK_BEHAVIOR_ON_SCREEN_OFF) {
-            clearUnlockedApp();
+        final int behavior = mRepository.getLockBehavior();
+        if (!done && behavior == LOCK_BEHAVIOR_ON_SCREEN_OFF) {
+            lockAllSessionsAndNotify();
+        } else if (changed && behavior == LOCK_BEHAVIOR_TIMEOUT && hasLockedPackages()) {
+            if (!done) {
+                scheduleTimeoutsExcept(Collections.emptySet());
+            } else {
+                mAtms.mH.post(this::relockExpiredFocusedApp);
+            }
         }
     }
 
@@ -121,7 +158,7 @@ public class AppLockService {
 
     public AppLockState computeAppLockState(String packageName, int userId) {
         if (TextUtils.isEmpty(packageName)) return NONE;
-        if (BLACKLISTED_PACKAGES.contains(packageName)) return NONE;
+        if (LOCK_EXEMPT_PACKAGES.contains(packageName)) return NONE;
         if (!mRepository.isAppLocked(packageName, userId)) return NONE;
         if (!mKeyguardDone) return LOCKED;
         return isSessionUnlocked(packageName, userId) ? UNLOCKED : LOCKED;
@@ -145,10 +182,12 @@ public class AppLockService {
 
     public boolean isAppLocked(String packageName, int uid, ComponentName component) {
         if (TextUtils.isEmpty(packageName)) return false;
-        if (BLACKLISTED_PACKAGES.contains(packageName)) return false;
+        if (LOCK_EXEMPT_PACKAGES.contains(packageName)) return false;
         int userId = UserHandle.getUserId(uid);
         if (!mRepository.isAppLocked(packageName, userId)) return false;
-        if (component != null && isAuthActivity(component)) return false;
+        if (component != null && (isAuthActivity(component) || isLockExemptActivity(component))) {
+            return false;
+        }
         return !isSessionUnlocked(packageName, userId);
     }
 
@@ -185,7 +224,7 @@ public class AppLockService {
                 Set<String> seen = new HashSet<>();
                 for (LauncherActivityInfo info : activities) {
                     String pkgName = info.getApplicationInfo().packageName;
-                    if (!BLACKLISTED_PACKAGES.contains(pkgName) && !seen.contains(pkgName)) {
+                    if (!LOCK_EXEMPT_PACKAGES.contains(pkgName) && !seen.contains(pkgName)) {
                         result.add(pkgName);
                         seen.add(pkgName);
                     }
@@ -199,8 +238,10 @@ public class AppLockService {
                 if (pm != null) {
                     List<ApplicationInfo> apps = pm.getInstalledApplicationsAsUser(0, userId);
                     for (ApplicationInfo appInfo : apps) {
-                        if (BLACKLISTED_PACKAGES.contains(appInfo.packageName)) continue;
-                        if (isSystemUid(appInfo.uid)) continue;
+                        if (LOCK_EXEMPT_PACKAGES.contains(appInfo.packageName)) continue;
+                        // Settings runs as the system uid but is lockable.
+                        if (isSystemUid(appInfo.uid)
+                                && !SETTINGS_PACKAGE.equals(appInfo.packageName)) continue;
                         if (pm.getLaunchIntentForPackage(appInfo.packageName) != null) {
                             result.add(appInfo.packageName);
                         }
@@ -218,7 +259,7 @@ public class AppLockService {
     }
 
     public boolean isPackageLockable(String packageName, int userId) {
-        if (TextUtils.isEmpty(packageName) || BLACKLISTED_PACKAGES.contains(packageName)) {
+        if (TextUtils.isEmpty(packageName) || LOCK_EXEMPT_PACKAGES.contains(packageName)) {
             return false;
         }
         if (mRepository.isAppLocked(packageName, userId)) {
@@ -434,8 +475,7 @@ public class AppLockService {
         final int newTaskId = (newTask != null) ? newTask.mTaskId : INVALID_TASK_ID;
 
         if (isTransientFocusInUnlockedTask(newFocus, newKey, newTaskId)) {
-            cancelTimeoutLock(mLastFocusedAppKey);
-            mUnlockTimestamps.put(mLastFocusedAppKey, SystemClock.elapsedRealtime());
+            markSessionInUse(mLastFocusedAppKey);
             lockTopApp(newTask, "onAppFocusChanged");
             return;
         }
@@ -448,10 +488,8 @@ public class AppLockService {
             }
         }
         if (newKey != null) {
-            cancelTimeoutLock(newKey);
-            if (mUnlockedApps.contains(newKey)) {
-                mUnlockTimestamps.put(newKey, SystemClock.elapsedRealtime());
-            }
+            expireIfTimedOut(newKey);
+            markSessionInUse(newKey);
         }
         mLastFocusedAppKey = newKey;
         mLastFocusedTaskId = newTaskId;
@@ -466,7 +504,7 @@ public class AppLockService {
                 && newTaskId != INVALID_TASK_ID
                 && newTaskId == mLastFocusedTaskId
                 && mUnlockedApps.contains(mLastFocusedAppKey)
-                && !hasAppLock(newFocus.packageName, newFocus.mUserId);
+                && !hasAppLockForActivity(newFocus);
     }
 
     public void onWindowingModeChanged(Task task, int prevMode) {
@@ -507,7 +545,17 @@ public class AppLockService {
     }
 
     public void clearUnlockedApp() {
-        lockAllSessionsExcept(Collections.emptySet());
+        switch (mRepository.getLockBehavior()) {
+            case LOCK_BEHAVIOR_ON_LEAVE:
+                lockAllSessionsAndNotify();
+                break;
+            case LOCK_BEHAVIOR_TIMEOUT:
+                scheduleTimeoutsExcept(Collections.emptySet());
+                break;
+            default:
+                // ON_SCREEN_OFF / ON_KILL sessions are relocked by their own triggers.
+                break;
+        }
     }
 
     public void clearUnlockedApp(ActivityRecord r) {
@@ -519,6 +567,11 @@ public class AppLockService {
 
         final Set<String> keep = new HashSet<>(2);
         final String key = sessionKey(r);
+        expireIfTimedOut(key);
+        final Task ownerTask = r.getTask();
+        if (ownerTask != null && !TextUtils.isEmpty(ownerTask.getBasePackageName())) {
+            expireIfTimedOut(sessionKey(ownerTask.mUserId, ownerTask.getBasePackageName()));
+        }
         if (mUnlockedApps.contains(key)) {
             keep.add(key);
         }
@@ -526,11 +579,20 @@ public class AppLockService {
         if (ownerKey != null) {
             keep.add(ownerKey);
         }
-        lockAllSessionsExcept(keep);
-
-        final long now = SystemClock.elapsedRealtime();
+        switch (mRepository.getLockBehavior()) {
+            case LOCK_BEHAVIOR_ON_LEAVE:
+                lockAllSessionsExcept(keep);
+                break;
+            case LOCK_BEHAVIOR_TIMEOUT:
+                // Leaving an app must start its grace period, not relock it.
+                scheduleTimeoutsExcept(keep);
+                break;
+            default:
+                // ON_SCREEN_OFF / ON_KILL: leaving an app never relocks it.
+                break;
+        }
         for (String k : keep) {
-            mUnlockTimestamps.put(k, now);
+            markSessionInUse(k);
         }
 
         if (WindowConfiguration.isFloating(r.getWindowingMode())) {
@@ -544,13 +606,9 @@ public class AppLockService {
         if (task == null) return null;
         final String basePkg = task.getBasePackageName();
         if (TextUtils.isEmpty(basePkg) || basePkg.equals(r.packageName)) return null;
-        if (hasAppLock(r.packageName, r.mUserId)) return null;
+        if (hasAppLockForActivity(r)) return null;
         final String ownerKey = sessionKey(task.mUserId, basePkg);
         return mUnlockedApps.contains(ownerKey) ? ownerKey : null;
-    }
-
-    private boolean isTransientTopOfTaskOwner(ActivityRecord top, String ownerKey) {
-        return top != null && ownerKey.equals(getUnlockedTaskOwnerKey(top));
     }
 
     public void removeTask(Task task, String reason) {
@@ -565,7 +623,7 @@ public class AppLockService {
         removeLockedApp(packageName, userId);
         String targetKey = sessionKey(userId, packageName);
         mUnlockedApps.remove(targetKey);
-        mUnlockTimestamps.remove(targetKey);
+        mLeftAt.remove(targetKey);
         cancelTimeoutLock(targetKey);
         clearPendingUnlock(packageName, userId);
     }
@@ -581,12 +639,23 @@ public class AppLockService {
     }
 
     public boolean isAppLockerActivity(ComponentName componentName) {
-        if (componentName == null) return false;
-        return APPLOCKER_PACKAGE.equals(componentName.getPackageName());
+        return UNLOCK_PROMPT_COMPONENT.equals(componentName);
+    }
+
+    private boolean hasAppLockForActivity(ActivityRecord r) {
+        if (r.mActivityComponent != null && isLockExemptActivity(r.mActivityComponent)) {
+            return false;
+        }
+        return hasAppLock(r.packageName, r.mUserId);
+    }
+
+    private static boolean isLockExemptActivity(ComponentName componentName) {
+        return SETTINGS_PACKAGE.equals(componentName.getPackageName())
+                && LOCK_EXEMPT_SETTINGS_ACTIVITIES.contains(componentName.getClassName());
     }
 
     public boolean isAuthActivity(ComponentName componentName) {
-        return isSandboxActivity(componentName) || isAppLockerActivity(componentName);
+        return isSandboxActivity(componentName);
     }
 
     public void registerAppLockStateListener(IAppLockStateListener listener) {
@@ -647,40 +716,24 @@ public class AppLockService {
         if (!mUnlockedApps.contains(key)) {
             return false;
         }
-        if (mRepository.getLockBehavior() != LOCK_BEHAVIOR_TIMEOUT) {
-            return true;
-        }
-        Long lastUsed = mUnlockTimestamps.get(key);
-        if (lastUsed == null || (SystemClock.elapsedRealtime() - lastUsed) <= (mRepository.getLockTimeout() * 1000L)) {
-            return true;
-        }
-        if (isActiveTopApp(packageName, userId)) {
-            mUnlockTimestamps.put(key, SystemClock.elapsedRealtime());
-            return true;
-        }
-        return false;
-    }
-
-    private boolean isActiveTopApp(String packageName, int userId) {
-        synchronized (mAtms.mGlobalLock) {
-            ActivityRecord top = mAtms.mRootWindowContainer.getTopResumedActivity();
-            return top != null && top.mUserId == userId && TextUtils.equals(top.packageName, packageName);
-        }
+        // Locks the session if its grace period ran out, even if the timer has not fired.
+        return !expireIfTimedOut(key);
     }
 
     private void markSessionUnlocked(String packageName, int userId) {
         String key = sessionKey(userId, packageName);
+        mLeftAt.remove(key);
+        cancelTimeoutLock(key);
         if (mUnlockedApps.add(key)) {
-            mUnlockTimestamps.put(key, SystemClock.elapsedRealtime());
             notifyAppSessionChanged(packageName, userId, true);
         }
     }
 
     public void markSessionLocked(String packageName, int userId) {
         String key = sessionKey(userId, packageName);
+        mLeftAt.remove(key);
+        cancelTimeoutLock(key);
         if (mUnlockedApps.remove(key)) {
-            mUnlockTimestamps.remove(key);
-            cancelTimeoutLock(key);
             notifyAppSessionChanged(packageName, userId, false);
         }
     }
@@ -697,11 +750,10 @@ public class AppLockService {
     private void lockAllSessionsExcept(Set<String> keep) {
         for (String key : mUnlockedApps.toArray(new String[0])) {
             if (keep.contains(key)) {
-                cancelTimeoutLock(key);
                 continue;
             }
             if (mUnlockedApps.remove(key)) {
-                mUnlockTimestamps.remove(key);
+                mLeftAt.remove(key);
                 cancelTimeoutLock(key);
                 notifySessionKeyLocked(key);
             }
@@ -709,7 +761,7 @@ public class AppLockService {
         if (keep.isEmpty()) {
             clearAllTimeouts();
         }
-        mUnlockTimestamps.keySet().retainAll(mUnlockedApps);
+        mLeftAt.keySet().retainAll(mUnlockedApps);
     }
 
     private void lockSessionKey(String key) {
@@ -731,23 +783,80 @@ public class AppLockService {
         }
     }
 
+    /**
+     * Starts the grace period for every unlocked session not in {@code keep} that is not
+     * already counting down. Sessions already counting down keep their original deadline.
+     */
+    private void scheduleTimeoutsExcept(Set<String> keep) {
+        for (String key : mUnlockedApps.toArray(new String[0])) {
+            if (!keep.contains(key) && !mTimeoutRunnables.containsKey(key)) {
+                scheduleTimeoutLock(key);
+            }
+        }
+    }
+
     private void scheduleTimeoutLock(String key) {
-        if (mRepository.getLockBehavior() != LOCK_BEHAVIOR_TIMEOUT || !mUnlockedApps.contains(key)) {
+        if (key == null || mRepository.getLockBehavior() != LOCK_BEHAVIOR_TIMEOUT
+                || !mUnlockedApps.contains(key)) {
             return;
         }
         cancelTimeoutLock(key);
-        Runnable r = () -> {
-            synchronized (mAtms.mGlobalLock) {
-                ActivityRecord top = mAtms.mRootWindowContainer.getTopResumedActivity();
-                String topKey = (top != null) ? sessionKey(top) : null;
-                if (!key.equals(topKey) && !isTransientTopOfTaskOwner(top, key)) {
-                    lockSessionKey(key);
-                }
-                mTimeoutRunnables.remove(key);
+        final long now = SystemClock.elapsedRealtime();
+        final long leftAt = mLeftAt.computeIfAbsent(key, k -> now);
+        final long remaining = getLockTimeoutMs() - (now - leftAt);
+        final Runnable[] self = new Runnable[1];
+        self[0] = () -> {
+            mTimeoutRunnables.remove(key, self[0]);
+            if (!expireIfTimedOut(key) && mLeftAt.containsKey(key)) {
+                scheduleTimeoutLock(key);
             }
         };
-        mTimeoutRunnables.put(key, r);
-        mAtms.mH.postDelayed(r, mRepository.getLockTimeout() * 1000L);
+        mTimeoutRunnables.put(key, self[0]);
+        mAtms.mH.postDelayed(self[0], Math.max(remaining, 0L) + 1L);
+    }
+
+    private void markSessionInUse(String key) {
+        if (key == null || !mKeyguardDone) {
+            return;
+        }
+        mLeftAt.remove(key);
+        cancelTimeoutLock(key);
+    }
+
+    private boolean expireIfTimedOut(String key) {
+        if (key == null || mRepository.getLockBehavior() != LOCK_BEHAVIOR_TIMEOUT
+                || !mUnlockedApps.contains(key)) {
+            return false;
+        }
+        Long leftAt = mLeftAt.get(key);
+        if (leftAt == null || SystemClock.elapsedRealtime() - leftAt <= getLockTimeoutMs()) {
+            return false;
+        }
+        lockSessionKey(key);
+        return true;
+    }
+
+    private long getLockTimeoutMs() {
+        return Math.max(mRepository.getLockTimeout(), 0) * 1000L;
+    }
+
+    private void relockExpiredFocusedApp() {
+        synchronized (mAtms.mGlobalLock) {
+            for (String key : mLeftAt.keySet().toArray(new String[0])) {
+                expireIfTimedOut(key);
+            }
+            final DisplayContent dc = mAtms.mWindowManager.getDefaultDisplayContentLocked();
+            final ActivityRecord focused = dc != null ? dc.mFocusedApp : null;
+            if (focused == null || !mKeyguardDone) {
+                return;
+            }
+            final String focusedKey = sessionKey(focused);
+            if (mUnlockedApps.contains(focusedKey)) {
+                markSessionInUse(focusedKey);
+            }
+            markSessionInUse(getUnlockedTaskOwnerKey(focused));
+            lockTopApp(focused.getTask(), "keyguardDone");
+        }
     }
 
     private void cancelTimeoutLock(String key) {
@@ -895,29 +1004,11 @@ public class AppLockService {
 
     private Intent getConfirmIntent() {
         if (mConfirmIntent == null) {
-            Intent appLockerIntent = new Intent("com.android.applocker.action.SYSTEM_UNLOCK");
-            appLockerIntent.setClassName(APPLOCKER_PACKAGE, APPLOCKER_ACTIVITY);
-            appLockerIntent.addFlags(Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
-
-            PackageManager pm = (mContext != null) ? mContext.getPackageManager() : null;
-            if (pm != null) {
-                try {
-                    if (pm.resolveActivity(appLockerIntent, PackageManager.MATCH_DEFAULT_ONLY) != null) {
-                        mConfirmIntent = appLockerIntent;
-                        return mConfirmIntent;
-                    }
-                } catch (Exception ignored) {
-                }
-            }
-
-            Intent sandboxIntent = new Intent(ACTION_SYSTEM_UNLOCK);
-            sandboxIntent.setClassName(SANDBOX_PACKAGE, "com.android.axion.sandbox.AuthenticateActivity");
-            sandboxIntent.addFlags(Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
-
-            if (pm != null) {
-                mConfirmIntent = sandboxIntent;
-            }
-            return (pm != null) ? sandboxIntent : appLockerIntent;
+            Intent intent = new Intent(ACTION_SYSTEM_UNLOCK);
+            intent.setComponent(UNLOCK_PROMPT_COMPONENT);
+            intent.addFlags(Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+                    | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
+            mConfirmIntent = intent;
         }
         return mConfirmIntent;
     }

@@ -62,6 +62,7 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -204,6 +205,7 @@ fun SliderPreference(
 
                 if (onReset != null && enabled) {
                     val resetHint = stringResource(R.string.long_press_to_reset)
+                    val resetLabel = stringResource(R.string.reset_to_default)
                     val toastContext = LocalContext.current
                     Spacer(modifier = Modifier.width(PreferenceTokens.PaddingHorizontal))
                     Box(
@@ -211,6 +213,8 @@ fun SliderPreference(
                             .size(PreferenceTokens.IconSize)
                             .clip(CircleShape)
                             .combinedClickable(
+                                role = Role.Button,
+                                onLongClickLabel = resetLabel,
                                 onClick = {
                                     Toast.makeText(toastContext, resetHint, Toast.LENGTH_SHORT).show()
                                 },
@@ -223,7 +227,7 @@ fun SliderPreference(
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.Refresh,
-                            contentDescription = null,
+                            contentDescription = resetLabel,
                             tint = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.size(20.dp)
                         )
@@ -242,6 +246,7 @@ fun SliderPreference(
             steps = steps,
             enabled = enabled,
             contentAlpha = contentAlpha,
+            displayValue = displayValue,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = PreferenceTokens.SliderHorizontalPadding),
@@ -264,10 +269,12 @@ private fun SettingsLibExpressiveSlider(
     steps: Int,
     enabled: Boolean,
     contentAlpha: Float,
+    displayValue: String,
     modifier: Modifier = Modifier,
 ) {
     val onValueChangeState = rememberUpdatedState(onValueChange)
     val onFinishedState = rememberUpdatedState(onValueChangeFinished)
+    val displayValueState = rememberUpdatedState(displayValue)
     val rangeSpan = valueRange.endInclusive - valueRange.start
     val stepSize = if (steps > 0 && rangeSpan > 0f) {
         rangeSpan / (steps + 1)
@@ -284,6 +291,7 @@ private fun SettingsLibExpressiveSlider(
             )
             val slider = root.findViewById<MaterialSlider>(SettingsLibSliderR.id.slider)
             applyExpressiveSliderMetrics(slider)
+            slider.setLabelFormatter { displayValueState.value }
             slider.valueFrom = valueRange.start
             slider.valueTo = valueRange.endInclusive
             slider.stepSize = stepSize
